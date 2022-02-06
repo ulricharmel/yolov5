@@ -235,7 +235,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                        hyp=hyp, cache=None if noval else opt.cache, rect=True, rank=-1,
                                        workers=workers, pad=0.5,
                                        prefix=colorstr('val: '))[0]
-        import pdb; pdb.set_trace()
+        
         if not resume:
             labels = np.concatenate(dataset.labels, 0)
             # c = torch.tensor(labels[:, 0])  # classes
