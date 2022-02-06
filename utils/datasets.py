@@ -688,8 +688,14 @@ class LoadImagesAndLabelsDF(Dataset):
             self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
         
         self.labels = []
+        self.shapes = []
         for _, row in df.iterrows():
             self.labels.append(self.get_boxes(row))
+            _,_, imshape = simple_load(row['path'], img_size, augment)
+            self.shapes.append(imshape)
+        
+        self.shapes = np.array(self.shapes)
+
 
     def __len__(self):
         return len(self.ds)
