@@ -16,6 +16,7 @@ from multiprocessing.pool import Pool, ThreadPool
 from pathlib import Path
 from threading import Thread
 from zipfile import ZipFile
+import pandas as pd
 
 import cv2
 import numpy as np
@@ -97,7 +98,7 @@ def create_dataloader(path, imgsz, batch_size, stride, single_cls=False, hyp=Non
         LOGGER.warning('WARNING: --rect is incompatible with DataLoader shuffle, setting shuffle=False')
         shuffle = False
     with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
-        dataset = LoadImagesAndLabels(path, imgsz, batch_size,
+        dataset = LoadImagesAndLabelsDF(path, imgsz, batch_size,
                                       augment=augment,  # augmentation
                                       hyp=hyp,  # hyperparameters
                                       rect=rect,  # rectangular batches
@@ -119,7 +120,7 @@ def create_dataloader(path, imgsz, batch_size, stride, single_cls=False, hyp=Non
                   num_workers=nw,
                   sampler=sampler,
                   pin_memory=True,
-                  collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn), dataset
+                  collate_fn=LoadImagesAndLabelsDF.collate_fn4 if quad else LoadImagesAndLabelsDF.collate_fn), dataset
 
 
 class InfiniteDataLoader(dataloader.DataLoader):
@@ -658,6 +659,153 @@ class LoadImagesAndLabels(Dataset):
         return torch.stack(img4, 0), torch.cat(label4, 0), path4, shapes4
 
 
+class LoadImagesAndLabelsDF(Dataset):
+    # YOLOv5 train_loader/val_loader, loads images and labels for training and validation
+    # Custom hack to load the images from a pandas data frame
+    cache_version = 0.6  # dataset labels *.cache version
+
+    def __init__(self, df, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
+                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
+        self.img_size = img_size
+        self.augment = augment
+        self.hyp = hyp
+        self.image_weights = image_weights
+        self.rect = False if image_weights else rect
+        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+        self.mosaic_border = [-img_size // 2, -img_size // 2]
+        self.stride = stride
+        self.ds = df
+        self.albumentations = Albumentations() if augment else None
+
+         # Rectangular Training
+        if self.rect:
+            # Sort by aspect ratio
+            s = (1280, 720)
+            ar = s[1]/s[0]
+            # Set training image shapes
+            shapes = [[1, 1/ar]]*batch_size
+
+            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, index):
+        # index = self.indices[index]  # linear, shuffled, or image_weights
+        img_path = self.ds.loc[index,'path']
+
+        hyp = self.hyp
+        
+        # Load image
+        img, (h0, w0), (h, w) = simple_load(img_path, self.img_size, self.augment)
+
+        # Letterbox
+        shape = self.batch_shapes[0] if self.rect else self.img_size  # final letterboxed shape
+        img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+        shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+        
+        row = self.ds.iloc[index]
+        labels = self.get_boxes(row)
+
+        if labels.size:  # normalized xywh to pixel xyxy format
+            labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+
+        if self.augment:
+            img, labels = random_perspective(img, labels,
+                                                degrees=hyp['degrees'],
+                                                translate=hyp['translate'],
+                                                scale=hyp['scale'],
+                                                shear=hyp['shear'],
+                                                perspective=hyp['perspective'])
+
+        nl = len(labels)  # number of labels
+        if nl:
+            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1E-3)
+
+        if self.augment:
+            # Albumentations
+            img, labels = self.albumentations(img, labels)
+            nl = len(labels)  # update after albumentations
+
+            # HSV color-space
+            augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+
+            # Flip up-down
+            if random.random() < hyp['flipud']:
+                img = np.flipud(img)
+                if nl:
+                    labels[:, 2] = 1 - labels[:, 2]
+
+            # Flip left-right
+            if random.random() < hyp['fliplr']:
+                img = np.fliplr(img)
+                if nl:
+                    labels[:, 1] = 1 - labels[:, 1]
+
+            # Cutouts
+            # labels = cutout(img, labels, p=0.5)
+            # nl = len(labels)  # update after cutout
+
+        labels_out = torch.zeros((nl, 6))
+        if nl:
+            labels_out[:, 1:] = torch.from_numpy(labels)
+
+        # Convert
+        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img = np.ascontiguousarray(img)
+
+        # image_id = torch.tensor([index])
+
+        return torch.from_numpy(img), labels_out, img_path, shapes
+    
+    def get_boxes(self, row):
+        """Returns the bboxes for a given row as a 3D matrix with format [x_min, y_min, x_max, y_max]"""
+        
+        boxes = pd.DataFrame(row['annotations'], columns=['x', 'y', 'width', 'height']).astype(float).values
+        
+        # Change from [x_min, y_min, w, h] to [x_cente, y_centre, w, h]
+        boxes[:, 0] = boxes[:, 0] + boxes[:, 1]/2.
+        boxes[:, 1] = boxes[:, 1] + boxes[:, 3]/2. 
+        
+        # aussuming 1 class only by defualt
+        boxes  = np.insert(boxes, 0, 0, axis=1)
+
+        return boxes
+
+    @staticmethod
+    def collate_fn(batch):
+        img, label, path, shapes = zip(*batch)  # transposed
+        for i, l in enumerate(label):
+            l[:, 0] = i  # add target image index for build_targets()
+        return torch.stack(img, 0), torch.cat(label, 0), path, shapes
+
+    @staticmethod
+    def collate_fn4(batch):
+        img, label, path, shapes = zip(*batch)  # transposed
+        n = len(shapes) // 4
+        img4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
+
+        ho = torch.tensor([[0.0, 0, 0, 1, 0, 0]])
+        wo = torch.tensor([[0.0, 0, 1, 0, 0, 0]])
+        s = torch.tensor([[1, 1, 0.5, 0.5, 0.5, 0.5]])  # scale
+        for i in range(n):  # zidane torch.zeros(16,3,720,1280)  # BCHW
+            i *= 4
+            if random.random() < 0.5:
+                im = F.interpolate(img[i].unsqueeze(0).float(), scale_factor=2.0, mode='bilinear', align_corners=False)[
+                    0].type(img[i].type())
+                l = label[i]
+            else:
+                im = torch.cat((torch.cat((img[i], img[i + 1]), 1), torch.cat((img[i + 2], img[i + 3]), 1)), 2)
+                l = torch.cat((label[i], label[i + 1] + ho, label[i + 2] + wo, label[i + 3] + ho + wo), 0) * s
+            img4.append(im)
+            label4.append(l)
+
+        for i, l in enumerate(label4):
+            l[:, 0] = i  # add target image index for build_targets()
+
+        return torch.stack(img4, 0), torch.cat(label4, 0), path4, shapes4
+
+
 # Ancillary functions --------------------------------------------------------------------------------------------------
 def load_image(self, i):
     # loads 1 image from dataset index 'i', returns im, original hw, resized hw
@@ -678,6 +826,18 @@ def load_image(self, i):
         return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
     else:
         return self.imgs[i], self.img_hw0[i], self.img_hw[i]  # im, hw_original, hw_resized
+
+
+def simple_load(path, img_size, augment):
+    im = cv2.imread(path)  # BGR
+    assert im is not None, f'Image Not Found {path}'
+    h0, w0 = im.shape[:2]  # orig hw
+    r = img_size / max(h0, w0)  # ratio
+    if r != 1:  # if sizes are not equal
+        im = cv2.resize(im, (int(w0 * r), int(h0 * r)),
+                    interpolation=cv2.INTER_AREA if r < 1 and not augment else cv2.INTER_LINEAR)
+    
+    return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
 
 
 def load_mosaic(self, index):
