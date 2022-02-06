@@ -687,8 +687,10 @@ class LoadImagesAndLabelsDF(Dataset):
 
             self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
         
-
-        self.labels = list(self.get_boxes(df))
+        self.labels = []
+        for idx in df.index.values:
+            row = df.iloc[idx]
+            self.labels.append(self.get_boxes(row))
 
     def __len__(self):
         return len(self.ds)
