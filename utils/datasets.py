@@ -702,6 +702,7 @@ class LoadImagesAndLabelsDF(Dataset):
 
     def __getitem__(self, index):
         # index = self.indices[index]  # linear, shuffled, or image_weights
+        import pdb; pdb.set_trace()
         img_path = self.ds.loc[index,'path']
 
         hyp = self.hyp
